@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -22,7 +23,6 @@ def makeconfig():
         "Thingspeak": {
             "ThingSpeak_channel_id": "YOUR_THINGSPEAK_CHANNEL_ID",
             "read_api_key": "YOUR_THINGSPEAK_READ_API_KEY",
-            "field_numbers": [1],
         },
         "Discord": {
             "bot_token": "YOUR_BOT_TOKEN",
@@ -47,9 +47,13 @@ def ensure_config():
 
 
 def getconfig(section, key):
-    with CONFIG_PATH.open("r", encoding="utf-8") as config_file:
-        config = json.load(config_file)
+    config = read_config()
     return config[section][key]
+
+
+def read_config():
+    with CONFIG_PATH.open("r", encoding="utf-8") as config_file:
+        return json.load(config_file)
 
 
 def save_config(config):
@@ -75,9 +79,10 @@ def read_discord_channel_ids(config):
     return channel_ids
 
 
-def get_ntp_time():
-    ntp_server = getconfig("ntp", "ntp_server")
-    timezone_offset = getconfig("ntp", "timezone_offset")
+def get_ntp_time(config=None):
+    config = config or read_config()
+    ntp_server = config["ntp"]["ntp_server"]
+    timezone_offset = config["ntp"]["timezone_offset"]
     local_timezone = timezone(timedelta(hours=int(timezone_offset)))
 
     try:
@@ -88,17 +93,15 @@ def get_ntp_time():
         return datetime.now(local_timezone)
 
 
-def get_thingspeak_data(field_num: int) -> int | None:
-    channel_id = getconfig("Thingspeak", "ThingSpeak_channel_id")
-    read_api_key = getconfig("Thingspeak", "read_api_key")
+def get_thingspeak_data(config=None) -> list[int | float]:
+    config = config or read_config()
+    channel_id = config["Thingspeak"]["ThingSpeak_channel_id"]
+    read_api_key = config["Thingspeak"]["read_api_key"]
     if not channel_id or channel_id.startswith("YOUR_") or not read_api_key or read_api_key.startswith("YOUR_"):
         logger.error("ThingSpeak channel ID or read API key is not configured.")
-        return None
+        return []
 
-    url = (
-        f"https://api.thingspeak.com/channels/{channel_id}/fields/"
-        f"{field_num}.json"
-    )
+    url = f"https://api.thingspeak.com/channels/{channel_id}/feeds.json"
     try:
         response = requests.get(
             url,
@@ -107,17 +110,42 @@ def get_thingspeak_data(field_num: int) -> int | None:
         )
         response.raise_for_status()
         feeds = response.json().get("feeds", [])
-        if not feeds or feeds[0].get(f"field{field_num}") is None:
-            logger.warning("No data found for ThingSpeak field %s.", field_num)
-            return None
-        return int(feeds[0][f"field{field_num}"])
+        if not feeds:
+            logger.warning("No ThingSpeak feed data found.")
+            return []
+
+        feed = feeds[0]
+        field_names = sorted(
+            (
+                key for key in feed
+                if key.startswith("field") and key[5:].isdigit()
+            ),
+            key=lambda key: int(key[5:]),
+        )
+        values = []
+        for field_name in field_names:
+            raw_value = feed[field_name]
+            if raw_value is None:
+                continue
+            try:
+                numeric_value = float(raw_value)
+            except (TypeError, ValueError):
+                logger.warning("Ignoring non-numeric ThingSpeak value for %s: %r", field_name, raw_value)
+                continue
+            if not math.isfinite(numeric_value):
+                logger.warning("Ignoring non-finite ThingSpeak value for %s: %r", field_name, raw_value)
+                continue
+            values.append(
+                int(numeric_value) if numeric_value.is_integer() else numeric_value
+            )
+        return values
     except (requests.RequestException, ValueError) as error:
-        logger.error("Could not get integer data for ThingSpeak field %s: %s", field_num, error)
-        return None
+        logger.error("Could not get ThingSpeak data: %s", error)
+        return []
 
 
-async def send_discord_msg(bot, message):
-    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+async def send_discord_msg(bot, message, config=None):
+    config = config or read_config()
     channel_ids = read_discord_channel_ids(config)
     for channel_id in channel_ids:
         channel = bot.get_channel(int(channel_id))
@@ -133,19 +161,14 @@ async def send_discord_msg(bot, message):
             logger.exception("Could not send a message to Discord channel %s.", channel_id)
 
 
-async def scheduled_task(bot):
-    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    field_numbers = config.get("Thingspeak", {}).get("field_numbers", [1])
-    readings = []
-    for field_num in field_numbers:
-        value = await asyncio.to_thread(get_thingspeak_data, int(field_num))
-        if value is not None:
-            readings.append(f"field{field_num}: {value}")
+async def process_data(bot, data, config):
+    """Apply optional processing rules before sending the data."""
+    if not data:
+        logger.warning("No ThingSpeak readings to process this time.")
+        return
 
-    if readings:
-        await send_discord_msg(bot, "\n".join(readings))
-    else:
-        logger.warning("No ThingSpeak readings to send this time.")
+    send_data = data
+    await send_discord_msg(bot, str(send_data), config)
 
 
 def next_schedule_time(now):
@@ -155,17 +178,10 @@ def next_schedule_time(now):
     return now.replace(minute=next_minute, second=0, microsecond=0)
 
 
-async def schedule_loop(bot):
-    while not bot.is_closed():
-        current_time = await asyncio.to_thread(get_ntp_time)
-        scheduled_time = next_schedule_time(current_time)
-        await asyncio.sleep(max(0, (scheduled_time - current_time).total_seconds()))
-        await scheduled_task(bot)
-
-
-def Discord_init():
-    bot_token = getconfig("Discord", "bot_token")
-    command_prefix = getconfig("Discord", "command_prefix")
+def Discord_init(config=None):
+    config = config or read_config()
+    bot_token = config["Discord"]["bot_token"]
+    command_prefix = config["Discord"]["command_prefix"]
     if not bot_token or bot_token.startswith("YOUR_"):
         logger.error("Set a valid Discord bot token in config.json before starting.")
         return None
@@ -202,20 +218,31 @@ def Discord_init():
             save_config(config)
         await ctx.send("このチャンネルの登録を解除しました。")
 
-    @bot.event
-    async def on_ready():
-        logger.info("Logged in as %s", bot.user)
-        if not hasattr(bot, "schedule_task") or bot.schedule_task.done():
-            bot.schedule_task = asyncio.create_task(schedule_loop(bot))
-
     return bot
 
 
 def main():
     ensure_config()
-    bot = Discord_init()
+    config = read_config()
+    bot = Discord_init(config)
     if bot is not None:
-        bot.run(getconfig("Discord", "bot_token"))
+        async def loop():
+            logger.info("Logged in as %s", bot.user)
+            while not bot.is_closed():
+                config = read_config()
+                current_time = await asyncio.to_thread(get_ntp_time, config)
+                scheduled_time = next_schedule_time(current_time)
+                await asyncio.sleep(max(0, (scheduled_time - current_time).total_seconds()))
+
+                config = read_config()
+                data = await asyncio.to_thread(get_thingspeak_data, config)
+                await process_data(bot, data, config)
+
+        async def setup_hook():
+            bot.loop_task = asyncio.create_task(loop())
+
+        bot.setup_hook = setup_hook
+        bot.run(config["Discord"]["bot_token"])
 
 
 if __name__ == "__main__":
